@@ -1,15 +1,19 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const { contextBridge, ipcRenderer } = require("electron");
 
+function subscribe(channel, handler) {
+  if (typeof handler !== "function") return () => {};
+  const listener = (_event, payload) => handler(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
 contextBridge.exposeInMainWorld("yinchaDesktop", {
   platform: process.platform,
-  setupCable: (output) => ipcRenderer.invoke("yincha:setup-cable", output === "headphones" ? "headphones" : "speakers"),
-  restoreAudio: () => ipcRenderer.invoke("yincha:restore-audio"),
+  audioState: () => ipcRenderer.invoke("yincha:audio-state"),
+  onAudioState: (handler) => subscribe("yincha:audio-state", handler),
+  engage: () => ipcRenderer.invoke("yincha:engage"),
+  release: () => ipcRenderer.invoke("yincha:release"),
   watchSongs: (enabled) => ipcRenderer.invoke("yincha:watch-songs", !!enabled),
-  onSongChange: (handler) => {
-    if (typeof handler !== "function") return () => {};
-    const listener = (_event, song) => handler(song);
-    ipcRenderer.on("yincha:song-change", listener);
-    return () => ipcRenderer.removeListener("yincha:song-change", listener);
-  },
+  onSongChange: (handler) => subscribe("yincha:song-change", handler),
 });

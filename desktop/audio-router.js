@@ -1,16 +1,23 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
-const { execFileSync } = require("child_process");
+const { execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
 const PLAYER_EXES = ["QQMusic.exe", "msedge.exe", "chrome.exe"];
-// Older builds also pinned WebView2 and this app. Idle clears those pins.
-const RESTORE_EXES = [...PLAYER_EXES, "msedgewebview2.exe", "音叉.exe"];
+// Older builds also pinned WebView2 and this app. Nobody else pins them, so any pin there is ours.
+const LEGACY_EXES = ["msedgewebview2.exe", "音叉.exe"];
+const RESTORE_EXES = [...PLAYER_EXES, ...LEGACY_EXES];
 const APP_ROUTE_KEY = "HKCU\\Software\\Microsoft\\Multimedia\\Audio\\DefaultEndpoint";
+const BOOT_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+const BOOT_VALUE = "YinchaRestoreAudio";
+const SNAPSHOT_VERSION = 2;
 const VIRTUAL_PLAYBACK = /todesk|dubbing|voicemeeter|vb-?audio|virtual\s*(cable|audio|device)|oculus|steam\s*streaming/i;
 
-// idle: system playback follows the jack, capture stays a real mic, players are not pinned.
-// engaged: QQ / Edge / Chrome render only into CABLE Input. This app listens to CABLE Output.
+// The snapshot file is the whole state machine on disk:
+//   absent             nothing of ours is in the system; idle never touches devices
+//   engaging/engaged   players may point at CABLE Input; `original` is how to undo it
+// It is written before the first change and deleted only after a restore is verified,
+// so a crash at any point leaves either nothing or a snapshot the next start replays.
 
 function splitCsv(line) {
   const out = [];
@@ -34,7 +41,7 @@ function splitCsv(line) {
 
 function parseDeviceCsv(text) {
   const lines = String(text || "")
-    .replace(/^\uFEFF/, "")
+    .replace(/^﻿/, "")
     .split(/\r?\n/)
     .filter((line) => line.trim());
   if (lines.length < 2) return [];
@@ -47,6 +54,16 @@ function parseDeviceCsv(text) {
     });
     return row;
   });
+}
+
+function decodeText(buffer) {
+  const utf8 = buffer.toString("utf8");
+  if (!utf8.includes("�")) return utf8;
+  try {
+    return new TextDecoder("gb18030").decode(buffer);
+  } catch {
+    return utf8;
+  }
 }
 
 function processNameFromPath(processPath) {
@@ -111,6 +128,10 @@ function isVirtualPlayback(row) {
   return VIRTUAL_PLAYBACK.test(`${row?.Name || ""} ${row?.["Device Name"] || ""}`);
 }
 
+function isCableDevice(row) {
+  return /vb-?audio/i.test(row?.["Device Name"] || "") || /^CABLE\b/.test(row?.Name || "");
+}
+
 function isHeadphone(row) {
   return /耳机|Headphone|Headset/i.test(row?.Name || "");
 }
@@ -119,27 +140,30 @@ function isSpeaker(row) {
   return /扬声器|Speaker/i.test(row?.Name || "") && !/HDMI|Digital|数字/i.test(`${row?.Name || ""} ${row?.["Device Name"] || ""}`);
 }
 
-function followsJack(row) {
-  return !row || isVirtualPlayback(row) || isHeadphone(row) || isSpeaker(row);
+function isDefaultRender(row) {
+  return row.Default === "Render" || row["Default Multimedia"] === "Render";
 }
 
-function pickListenDevice(rows, prefer = "headphones") {
+// Where the retuned sound goes. A plugged-in wired headphone wins: on jack-sensing codecs
+// the headphone is its own endpoint while the speaker endpoint stays active. Otherwise
+// follow the Windows default (Bluetooth, USB DAC), then any real speaker.
+function pickListenDevice(rows) {
   const devices = activeDevices(rows).filter((row) => row.Direction === "Render" && !isVirtualPlayback(row));
-  const phones = devices.filter((row) => isHeadphone(row));
-  const speakers = devices.filter((row) => isSpeaker(row));
-  const unmuted = (list) => list.find((row) => row.Muted !== "Yes");
-  if (prefer === "speakers") return unmuted(speakers) || speakers[0] || unmuted(phones) || phones[0] || null;
-  return unmuted(phones) || phones[0] || unmuted(speakers) || speakers[0] || null;
+  const unmuted = (list) => list.find((row) => row.Muted !== "Yes") || list[0] || null;
+  return (
+    unmuted(devices.filter(isHeadphone)) ||
+    devices.find(isDefaultRender) ||
+    unmuted(devices.filter(isSpeaker)) ||
+    unmuted(devices)
+  );
 }
 
-function pickPhysicalCapture(rows) {
-  const devices = activeDevices(rows).filter((row) => row.Direction === "Capture" && !isVirtualPlayback(row));
-  return (
-    devices.find((row) => /阵列麦克风/i.test(row.Name || "")) ||
-    devices.find((row) => /麦克风|Microphone/i.test(row.Name || "")) ||
-    devices[0] ||
-    null
-  );
+function describeDevice(row) {
+  return { id: row["Item ID"] || "", name: row.Name || "", deviceName: row["Device Name"] || "" };
+}
+
+function sameId(left, right) {
+  return String(left || "").toLowerCase() === String(right || "").toLowerCase();
 }
 
 function parseAppRouteQuery(text) {
@@ -153,80 +177,77 @@ function parseAppRouteQuery(text) {
     const endpoint = block.match(/MMDEVAPI#(\{0\.0\.[01]\.00000000\}\.\{[0-9a-f-]+\})/i);
     pins.push({ key: key[0].trim(), exe, endpointId: endpoint ? endpoint[1] : "" });
   }
-  return pins.filter((pin) => RESTORE_EXES.some((exe) => exe.toLowerCase() === pin.exe.toLowerCase()));
+  return pins.filter((pin) => RESTORE_EXES.some((exe) => sameId(exe, pin.exe)));
 }
 
-function defaultRunReg(args) {
-  const result = execFileSync("reg", args, { encoding: "buffer", windowsHide: true, timeout: 15000 });
-  const buffer = Buffer.isBuffer(result) ? result : Buffer.from(result || "");
-  const utf8 = buffer.toString("utf8");
-  if (!utf8.includes("\uFFFD")) return utf8;
-  try {
-    return new TextDecoder("gb18030").decode(buffer);
-  } catch {
-    return utf8;
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function defaultRunFile(file, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { windowsHide: true, timeout: 15000, ...options }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+async function defaultRunReg(args) {
+  const out = await defaultRunFile("reg", args, { encoding: "buffer" });
+  return decodeText(Buffer.isBuffer(out) ? out : Buffer.from(out || ""));
+}
+
+function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runReg = defaultRunReg }) {
+  // Every svcl / reg call goes through one queue, so a device poll never interleaves with
+  // an engage or restore, and nothing blocks the Electron main thread.
+  const migratedFile = path.join(path.dirname(stateFile), "audio-pins-v2");
+  let chain = Promise.resolve();
+  /** @template T @param {() => Promise<T>} task @returns {Promise<T>} */
+  function serial(task) {
+    const run = chain.then(task, task);
+    chain = run.catch(() => undefined);
+    return run;
   }
-}
-
-function createAudioRouter({ svclPath, stateFile, runFile, runReg = defaultRunReg }) {
-  const runFileSync = runFile || execFileSync;
-  const reg = runReg;
-  let settledPlaybackId = "";
 
   function svclExists() {
     return Boolean(svclPath && fs.existsSync(svclPath));
   }
 
-  function runSvcl(args) {
+  async function svcl(args) {
     if (!svclExists()) return { ok: false, error: "找不到 svcl.exe" };
     try {
-      const out = runFileSync(svclPath, args, {
-        encoding: "utf8",
-        windowsHide: true,
-        timeout: 15000,
-      });
-      return { ok: true, out: out || "" };
+      await runFile(svclPath, args);
+      return { ok: true };
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      return { ok: false, error: errorText(error) };
     }
   }
 
-  function listRows() {
+  async function reg(args) {
+    try {
+      return { ok: true, out: await runReg(args) };
+    } catch (error) {
+      return { ok: false, error: errorText(error) };
+    }
+  }
+
+  async function listRows() {
     if (!svclExists()) return [];
     const csvPath = path.join(path.dirname(stateFile), "devices-now.csv");
     try {
       fs.mkdirSync(path.dirname(csvPath), { recursive: true });
-      runFileSync(svclPath, ["/scomma", csvPath], { windowsHide: true, timeout: 15000 });
-      const buffer = fs.readFileSync(csvPath);
-      const utf8 = buffer.toString("utf8");
-      let decoded = utf8;
-      if (utf8.includes("\uFFFD")) {
-        try {
-          decoded = new TextDecoder("gb18030").decode(buffer);
-        } catch {
-          decoded = utf8;
-        }
-      }
-      return parseDeviceCsv(decoded);
+      await runFile(svclPath, ["/scomma", csvPath]);
+      return parseDeviceCsv(decodeText(fs.readFileSync(csvPath)));
     } catch {
       return [];
     }
   }
 
-  function currentDefaults() {
-    const devices = activeDevices(listRows());
-    const playback = devices.find(
-      (row) => row.Direction === "Render" && (row.Default === "Render" || row["Default Multimedia"] === "Render"),
-    );
-    const recording = devices.find(
-      (row) => row.Direction === "Capture" && (row.Default === "Capture" || row["Default Multimedia"] === "Capture"),
-    );
-    return {
-      playbackId: playback?.["Item ID"] || "",
-      playbackName: playback?.Name || "",
-      recordingId: recording?.["Item ID"] || "",
-      recordingName: recording?.Name || "",
-    };
+  async function readPins() {
+    // A missing key just means no app has ever been pinned. Unpinned apps keep an empty entry.
+    const result = await reg(["query", APP_ROUTE_KEY, "/s"]);
+    return result.ok ? parseAppRouteQuery(result.out).filter((pin) => pin.endpointId) : [];
   }
 
   function loadSnapshot() {
@@ -234,25 +255,14 @@ function createAudioRouter({ svclPath, stateFile, runFile, runReg = defaultRunRe
       if (!fs.existsSync(stateFile)) return null;
       return JSON.parse(fs.readFileSync(stateFile, "utf8"));
     } catch {
-      return null;
+      // Unreadable still means something was in progress; restore treats it like a legacy snapshot.
+      return { phase: "unknown" };
     }
   }
 
   function saveSnapshot(snapshot) {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify(snapshot, null, 2), "utf8");
-  }
-
-  function queryPins() {
-    try {
-      return parseAppRouteQuery(reg(["query", APP_ROUTE_KEY, "/s"]));
-    } catch {
-      return [];
-    }
-  }
-
-  function sameId(left, right) {
-    return String(left || "").toLowerCase() === String(right || "").toLowerCase();
   }
 
   function forgetSnapshot() {
@@ -263,179 +273,167 @@ function createAudioRouter({ svclPath, stateFile, runFile, runReg = defaultRunRe
     }
   }
 
-  function deviceById(rows, itemId) {
-    return rows.find((row) => sameId(row["Item ID"], itemId)) || null;
-  }
-
-  function healSystem(rows, results) {
-    const defaults = currentDefaults();
-    const playback = deviceById(rows, defaults.playbackId);
-    const desiredPlay = pickListenDevice(rows, "headphones");
-    const recording = deviceById(rows, defaults.recordingId);
-    const desiredMic = !recording || isVirtualPlayback(recording) ? pickPhysicalCapture(rows) : null;
-    if (desiredPlay && followsJack(playback) && !sameId(defaults.playbackId, desiredPlay["Item ID"])) {
-      results.push(runSvcl(["/SetDefault", desiredPlay["Item ID"], "all"]));
-    }
-    if (desiredMic && !sameId(defaults.recordingId, desiredMic["Item ID"])) {
-      results.push(runSvcl(["/SetDefault", desiredMic["Item ID"], "all"]));
-    }
-    return { desiredPlay, desiredMic: desiredMic || recording };
-  }
-
-  function finish(results, names) {
-    const ok = results.every((result) => result.ok !== false);
-    return {
-      ok,
-      restored: ok && results.length > 0,
-      playbackName: names.playbackName || "",
-      recordingName: names.recordingName || "",
-      error: ok ? undefined : results.map((result) => result.error).filter(Boolean).join("；") || "声卡没有还原",
-    };
-  }
-
-  function applyCableRouting(prefer = "speakers") {
-    const output = prefer === "headphones" ? "headphones" : "speakers";
-    const rows = listRows();
+  function findCable(rows) {
     const devices = activeDevices(rows);
-    const cableIn = devices.find((row) => row.Direction === "Render" && row.Name === "CABLE Input");
-    const cableOut = devices.find((row) => row.Direction === "Capture" && row.Name === "CABLE Output");
-    const listen = pickListenDevice(rows, output);
-    if (!cableIn || !cableOut) {
-      return { ok: false, error: "未找到 VB-CABLE。请先安装虚拟声卡并重启电脑。", listenDevice: "" };
-    }
-    if (!listen || (output === "headphones" && !isHeadphone(listen))) {
-      return {
-        ok: false,
-        error: output === "headphones" ? "没有检测到耳机。" : "没有找到可用的外放或耳机。",
-        listenDevice: "",
-      };
-    }
-
-    const results = [];
-    healSystem(rows, results);
-    results.push(
-      runSvcl(["/Unmute", cableOut["Item ID"]]),
-      runSvcl(["/Unmute", cableIn["Item ID"]]),
-      runSvcl(["/Unmute", listen["Item ID"]]),
-      runSvcl(["/SetVolume", cableOut["Item ID"], "100"]),
-      runSvcl(["/SetVolume", cableIn["Item ID"], "100"]),
-    );
-    for (const exe of PLAYER_EXES) {
-      results.push(runSvcl(["/SetAppDefault", cableIn["Item ID"], "all", exe]));
-    }
-    const ok = results.every((result) => result.ok !== false);
-    if (!ok) {
-      return {
-        ok: false,
-        error: results.map((result) => result.error).filter(Boolean).join("；") || "没有接上虚拟声卡。",
-        listenDevice: listen.Name || "",
-      };
-    }
-    saveSnapshot({ phase: "engaged", output, savedAt: new Date().toISOString() });
     return {
-      ok: true,
-      cableIn: cableIn.Name,
-      cableOut: cableOut.Name,
-      listenDevice: listen.Name || "",
+      cableIn: devices.find((row) => row.Direction === "Render" && row.Name === "CABLE Input") || null,
+      cableOut: devices.find((row) => row.Direction === "Capture" && row.Name === "CABLE Output") || null,
     };
   }
 
-  function restoreAudio() {
-    const snapshot = loadSnapshot();
-    const rows = listRows();
-    const pins = queryPins();
-    const defaults = rows.length ? currentDefaults() : { playbackId: "", recordingId: "" };
-    const desiredPlay = rows.length ? pickListenDevice(rows, "headphones") : null;
-    const desiredId = desiredPlay?.["Item ID"] || "";
-    const playback = deviceById(rows, defaults.playbackId);
-    const recording = deviceById(rows, defaults.recordingId);
-    const captureDrift = !recording || isVirtualPlayback(recording);
-    const playbackDrift = Boolean(desiredId) && followsJack(playback) && !sameId(defaults.playbackId, desiredId);
-    const sessionDrift = Boolean(settledPlaybackId) && Boolean(desiredId) && !sameId(settledPlaybackId, desiredId);
-    if (!snapshot && !pins.length && !playbackDrift && !captureDrift && !sessionDrift) {
-      settledPlaybackId = defaults.playbackId || settledPlaybackId;
-      return { ok: true, restored: false, playbackName: playback?.Name || "", recordingName: recording?.Name || "" };
-    }
+  function levelOf(row) {
+    const volume = Number.parseFloat(String(row["Volume Percent"] || "").replace("%", ""));
+    return { id: row["Item ID"], muted: row.Muted === "Yes", volume: Number.isFinite(volume) ? Math.round(volume) : null };
+  }
 
+  // Back to "follow the system default", the same as choosing 默认 in Windows sound settings.
+  function unpin(exe) {
+    return svcl(["/SetAppDefault", "DefaultRenderDevice", "all", exe]);
+  }
+
+  async function restoreNow() {
+    const snapshot = loadSnapshot();
+    const rows = await listRows();
+    if (snapshot && !rows.length) return { ok: false, restored: false, error: "读不到声卡列表，没法确认还原。" };
+    const pins = await readPins();
+    const byId = (id) => rows.find((row) => sameId(row["Item ID"], id)) || null;
+    const ours = (pin) => isCableDevice(byId(pin.endpointId)) || LEGACY_EXES.some((exe) => sameId(exe, pin.exe));
     const results = [];
-    const healed = rows.length ? healSystem(rows, results) : { desiredPlay: null, desiredMic: null };
-    const releaseTarget = followsJack(playback) ? desiredPlay : playback;
-    const targetId = releaseTarget?.["Item ID"] || "";
-    if (targetId && (pins.length || playbackDrift || sessionDrift || snapshot)) {
-      for (const exe of RESTORE_EXES) results.push(runSvcl(["/SetAppDefault", targetId, "all", exe]));
-    }
-    if (pins.length) {
-      for (const pin of pins) {
-        try {
-          reg(["delete", pin.key, "/f"]);
-          results.push({ ok: true });
-        } catch (error) {
-          results.push({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    const handled = new Set();
+
+    if (snapshot?.version === SNAPSHOT_VERSION && snapshot.original) {
+      for (const want of snapshot.original.pins || []) {
+        handled.add(want.exe.toLowerCase());
+        const current = pins.find((pin) => sameId(pin.exe, want.exe));
+        const target = want.endpointId ? byId(want.endpointId) : null;
+        // Put back a pin the user made themselves, if that device is still around.
+        if (target && target["Device State"] === "Active" && !isCableDevice(target)) {
+          if (!sameId(current?.endpointId, want.endpointId)) {
+            results.push(await svcl(["/SetAppDefault", want.endpointId, "all", want.exe]));
+          }
+        } else if (current) {
+          results.push(await unpin(want.exe));
         }
       }
-    }
-    const names = {
-      playbackName: releaseTarget?.Name || healed.desiredPlay?.Name || playback?.Name || "",
-      recordingName: healed.desiredMic?.Name || recording?.Name || "",
-    };
-    const outcome = finish(results, names);
-    if (outcome.ok) {
-      settledPlaybackId = targetId || defaults.playbackId || "";
-      forgetSnapshot();
-      settledPlaybackId = targetId || defaults.playbackId || "";
-    }
-    if (!results.length) return { ...outcome, restored: Boolean(snapshot) && outcome.ok };
-    return outcome;
-  }
-
-  function reconcileEngaged() {
-    if (loadSnapshot()?.phase !== "engaged") return restoreAudio();
-    const rows = listRows();
-    const devices = activeDevices(rows);
-    const cableIn = devices.find((row) => row.Direction === "Render" && row.Name === "CABLE Input");
-    if (!cableIn) return { ok: false, error: "未找到 VB-CABLE。" };
-    const results = [];
-    healSystem(rows, results);
-    const pins = queryPins();
-    for (const exe of PLAYER_EXES) {
-      const pin = pins.find((item) => item.exe.toLowerCase() === exe.toLowerCase());
-      if (!pin || !sameId(pin.endpointId, cableIn["Item ID"])) {
-        results.push(runSvcl(["/SetAppDefault", cableIn["Item ID"], "all", exe]));
+      for (const level of snapshot.original.cable || []) {
+        if (!byId(level.id)) continue;
+        if (level.volume !== null) results.push(await svcl(["/SetVolume", level.id, String(level.volume)]));
+        results.push(await svcl([level.muted ? "/Mute" : "/Unmute", level.id]));
       }
     }
+
+    // Whatever is still ours. Older builds "restored" by pinning players to a physical device
+    // and kept no record of the original, so the first run of this build, or a snapshot left by
+    // an older one, sends every managed pin back to the system default.
+    const legacy = !fs.existsSync(migratedFile) || (Boolean(snapshot) && snapshot.version !== SNAPSHOT_VERSION);
     for (const pin of pins) {
-      if (PLAYER_EXES.some((exe) => exe.toLowerCase() === pin.exe.toLowerCase())) continue;
-      try {
-        reg(["delete", pin.key, "/f"]);
-        results.push({ ok: true });
-      } catch (error) {
-        results.push({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
+      if (handled.has(pin.exe.toLowerCase())) continue;
+      if (legacy || ours(pin)) results.push(await unpin(pin.exe));
     }
-    return finish(results, { playbackName: "", recordingName: "" });
+
+    // Verify instead of trusting exit codes: the snapshot goes only once nothing of ours is left.
+    const failures = results.filter((result) => !result.ok).map((result) => result.error);
+    if (results.length) {
+      const stuck = (await readPins()).filter(ours);
+      if (stuck.length) failures.push(`${stuck.map((pin) => pin.exe).join("、")} 还接在虚拟声卡上`);
+    }
+    if (failures.length) {
+      return { ok: false, restored: false, error: failures.filter(Boolean).join("；") || "声卡没有还原" };
+    }
+    if (snapshot) {
+      forgetSnapshot();
+      await reg(["delete", BOOT_KEY, "/v", BOOT_VALUE, "/f"]);
+    }
+    if (!fs.existsSync(migratedFile)) {
+      fs.mkdirSync(path.dirname(migratedFile), { recursive: true });
+      fs.writeFileSync(migratedFile, new Date().toISOString(), "utf8");
+    }
+    return { ok: true, restored: Boolean(snapshot) || results.length > 0 };
   }
 
-  function readNowPlaying() {
-    return pickSong(listRows());
+  async function engageNow(bootCommand) {
+    if (loadSnapshot()) {
+      const restored = await restoreNow();
+      if (!restored.ok) return { ok: false, error: `上次的设置还没还原：${restored.error}` };
+    }
+    const rows = await listRows();
+    const { cableIn, cableOut } = findCable(rows);
+    if (!cableIn || !cableOut) return { ok: false, error: "未找到 VB-CABLE。请先安装虚拟声卡并重启电脑。" };
+    const listen = pickListenDevice(rows);
+    if (!listen) return { ok: false, error: "没有找到可用的耳机或外放。" };
+
+    const pins = await readPins();
+    const original = {
+      pins: PLAYER_EXES.map((exe) => {
+        const pin = pins.find((item) => sameId(item.exe, exe));
+        return { exe, endpointId: pin && !isCableDevice(rows.find((row) => sameId(row["Item ID"], pin.endpointId))) ? pin.endpointId : "" };
+      }),
+      cable: [levelOf(cableIn), levelOf(cableOut)],
+    };
+    saveSnapshot({ version: SNAPSHOT_VERSION, phase: "engaging", original, savedAt: new Date().toISOString() });
+    // If the machine dies mid-session, the next login runs one headless restore.
+    if (bootCommand) await reg(["add", BOOT_KEY, "/v", BOOT_VALUE, "/t", "REG_SZ", "/d", bootCommand, "/f"]);
+
+    const results = [
+      await svcl(["/Unmute", cableOut["Item ID"]]),
+      await svcl(["/Unmute", cableIn["Item ID"]]),
+      await svcl(["/SetVolume", cableOut["Item ID"], "100"]),
+      await svcl(["/SetVolume", cableIn["Item ID"], "100"]),
+    ];
+    for (const exe of PLAYER_EXES) {
+      results.push(await svcl(["/SetAppDefault", cableIn["Item ID"], "all", exe]));
+    }
+    const failed = results.filter((result) => !result.ok);
+    if (failed.length) {
+      const rollback = await restoreNow();
+      const error = failed.map((result) => result.error).join("；") || "没有接上虚拟声卡。";
+      return { ok: false, error: rollback.ok ? error : `${error}；还原也失败了：${rollback.error}` };
+    }
+    saveSnapshot({ version: SNAPSHOT_VERSION, phase: "engaged", original, savedAt: new Date().toISOString() });
+    return { ok: true, listen: describeDevice(listen) };
+  }
+
+  // While engaged: keep players on the cable and report where the retuned sound should go.
+  async function reconcileNow() {
+    if (loadSnapshot()?.phase !== "engaged") return { ok: false, error: "没有在接管。" };
+    const rows = await listRows();
+    const { cableIn } = findCable(rows);
+    if (!cableIn) return { ok: false, error: "VB-CABLE 不见了。" };
+    const pins = await readPins();
+    for (const exe of PLAYER_EXES) {
+      const pin = pins.find((item) => sameId(item.exe, exe));
+      if (!pin || !sameId(pin.endpointId, cableIn["Item ID"])) {
+        await svcl(["/SetAppDefault", cableIn["Item ID"], "all", exe]);
+      }
+    }
+    const listen = pickListenDevice(rows);
+    return { ok: true, listen: listen ? describeDevice(listen) : null };
   }
 
   function createSongWatcher(onChange) {
     let timer = null;
     let lastKey = "";
-    const tick = () => {
-      const song = readNowPlaying();
-      if (!song) return;
-      const key = `${song.process}::${song.title}`;
-      if (key === lastKey) return;
-      const previous = lastKey;
-      lastKey = key;
-      if (previous) onChange(song);
+    let ticking = false;
+    const tick = async () => {
+      if (ticking) return;
+      ticking = true;
+      try {
+        const song = await serial(async () => pickSong(await listRows()));
+        if (!timer || !song) return;
+        const key = `${song.process}::${song.title}`;
+        if (key === lastKey) return;
+        const previous = lastKey;
+        lastKey = key;
+        if (previous) onChange(song);
+      } finally {
+        ticking = false;
+      }
     };
     return {
       start(intervalMs = 2000) {
         if (timer) return;
-        tick();
-        timer = setInterval(tick, intervalMs);
+        timer = setInterval(() => void tick(), intervalMs);
+        void tick();
       },
       stop() {
         if (timer) clearInterval(timer);
@@ -447,12 +445,11 @@ function createAudioRouter({ svclPath, stateFile, runFile, runReg = defaultRunRe
 
   return {
     svclExists,
-    applyCableRouting,
-    restoreAudio,
     loadSnapshot,
+    restore: () => serial(restoreNow),
+    engage: (bootCommand) => serial(() => engageNow(bootCommand)),
+    reconcile: () => serial(reconcileNow),
     createSongWatcher,
-    readNowPlaying,
-    reconcileEngaged,
   };
 }
 
@@ -467,13 +464,13 @@ function resolveSvclPath(execPath = process.execPath) {
 
 module.exports = {
   PLAYER_EXES,
+  LEGACY_EXES,
   RESTORE_EXES,
   parseDeviceCsv,
   normalizeTitle,
   looksLikeSong,
   pickSong,
   pickListenDevice,
-  pickPhysicalCapture,
   parseAppRouteQuery,
   createAudioRouter,
   resolveSvclPath,

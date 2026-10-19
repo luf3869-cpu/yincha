@@ -58,6 +58,11 @@ const appPaths = await packager({
 
 const appDir = appPaths[0];
 if (!appDir) throw new Error("没有生成 Windows 程序");
+// The desktop build exports into .next-desktop; desktop/main.js serves it from resources/app/out.
+const exported = path.join(root, ".next-desktop");
+if (!fs.existsSync(path.join(exported, "index.html"))) throw new Error("没有找到导出的页面");
+// Not cpSync: on Windows it mangles the non-ASCII 音叉 path.
+await fs.promises.cp(exported, path.join(appDir, "resources", "app", "out"), { recursive: true });
 fs.copyFileSync(path.join(root, "desktop", "开始使用.txt"), path.join(appDir, "开始使用.txt"));
 const svcl = path.join(root, "tools", "svcl", "svcl.exe");
 if (fs.existsSync(svcl)) {
@@ -70,7 +75,9 @@ const zipPath = path.join(root, "release", "音叉-Windows.zip");
 fs.rmSync(zipPath, { force: true });
 const folderName = path.basename(appDir);
 if (os.platform() === "win32") {
-  execFileSync("tar", ["-a", "-c", "-f", zipPath, folderName], {
+  // The bsdtar that ships with Windows; Git's GNU tar reads "D:\..." as a remote host.
+  const tar = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  execFileSync(tar, ["-a", "-c", "-f", zipPath, folderName], {
     cwd: path.dirname(appDir),
     stdio: "inherit",
   });

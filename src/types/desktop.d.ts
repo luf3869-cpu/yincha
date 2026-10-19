@@ -4,19 +4,30 @@ export type SongChange = {
   pid?: number;
 };
 
-export type CableSetupResult = {
-  ok: boolean;
-  error?: string;
-  cableIn?: string;
-  cableOut?: string;
-  listenDevice?: string;
+export type ListenDevice = {
+  id: string;
+  name: string;
+  deviceName: string;
 };
 
-export type AudioRestoreResult = {
+export type AudioPhase = "checking" | "idle" | "engaging" | "engaged" | "releasing" | "error";
+
+export type AudioState = {
+  phase: AudioPhase;
+  message: string;
+  recovered: boolean;
+  listen: ListenDevice | null;
+};
+
+export type EngageResult = {
+  ok: boolean;
+  error?: string;
+  listen?: ListenDevice;
+};
+
+export type ReleaseResult = {
   ok: boolean;
   restored?: boolean;
-  playbackName?: string;
-  recordingName?: string;
   error?: string;
 };
 
@@ -24,8 +35,10 @@ declare global {
   interface Window {
     yinchaDesktop?: {
       platform: string;
-      setupCable?: (output?: "speakers" | "headphones") => Promise<CableSetupResult>;
-      restoreAudio?: () => Promise<AudioRestoreResult>;
+      audioState?: () => Promise<AudioState>;
+      onAudioState?: (handler: (state: AudioState) => void) => () => void;
+      engage?: () => Promise<EngageResult>;
+      release?: () => Promise<ReleaseResult>;
       watchSongs?: (enabled: boolean) => Promise<{ ok: boolean }>;
       onSongChange?: (handler: (song: SongChange) => void) => () => void;
     };

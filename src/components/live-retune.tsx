@@ -4,10 +4,11 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { analyzeTuning, type TuningReport } from "@/lib/analyze-tuning";
-import { pickCableOutput } from "@/lib/cable-device";
+import { pickCableOutput, pickListenOutput } from "@/lib/cable-device";
 import { workletSource } from "@/lib/live-pitch";
 import { formatCents, formatHz, retuneRate } from "@/lib/tuning-math";
 import { cn } from "@/lib/utils";
+import type { AudioState, ListenDevice } from "@/types/desktop";
 
 const LISTEN_SECONDS = 8;
 const RELISTEN_MS = 3 * 60 * 1000;
@@ -126,20 +127,23 @@ async function captureMic(requireCable = false): Promise<MediaStream> {
   }
 }
 
-async function routeOutput(ctx: AudioContext, prefer: "speakers" | "headphones"): Promise<boolean> {
+async function routeOutput(ctx: AudioContext, listen: ListenDevice): Promise<boolean> {
   const sink = ctx as AudioContext & { setSinkId?: (sinkId: string) => Promise<void> };
   if (typeof sink.setSinkId !== "function") return false;
-  const outputs = (await navigator.mediaDevices.enumerateDevices()).filter(
-    (device) => device.kind === "audiooutput" && device.deviceId,
-  );
-  const avoid = /cable|vb-?audio|todesk|voicemeeter|virtual/i;
-  const want = prefer === "headphones" ? /耳机|headphone|headset/i : /扬声器|speaker/i;
-  const match =
-    outputs.find((device) => want.test(device.label) && !avoid.test(device.label)) ||
-    outputs.find((device) => device.deviceId !== "default" && device.deviceId !== "communications" && !avoid.test(device.label));
+  const match = pickListenOutput(await navigator.mediaDevices.enumerateDevices(), listen);
   if (!match) return false;
   await sink.setSinkId(match.deviceId);
   return true;
+}
+
+function describeAudio(state: AudioState | null): string {
+  if (!state || state.phase === "checking") return "正在检查声卡设置…";
+  if (state.phase === "engaging") return "正在接到虚拟声卡…";
+  if (state.phase === "releasing") return "正在把播放器放回原来的设备…";
+  if (state.phase === "error") return `声卡设置没有还原：${state.message}`;
+  if (state.phase === "engaged") return state.listen ? `正在从「${state.listen.name}」播出。` : "";
+  if (state.recovered) return "上次退出时声卡设置没有还原，已经复原。";
+  return "声卡设置正常。插着耳机就从耳机播出，没插就走外放。";
 }
 
 async function captureDisplay(): Promise<MediaStream> {
@@ -172,7 +176,6 @@ async function captureDisplay(): Promise<MediaStream> {
 
 export function LiveRetune() {
   const [source, setSource] = useState<SourceKind>("mic");
-  const [output, setOutput] = useState<"speakers" | "headphones">("speakers");
   const [headphones, setHeadphones] = useState(false);
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState<LivePhase>("idle");
@@ -181,6 +184,7 @@ export function LiveRetune() {
   const [heard, setHeard] = useState(0);
   const [report, setReport] = useState<TuningReport | null>(null);
   const [globalMode, setGlobalMode] = useState(false);
+  const [audioState, setAudioState] = useState<AudioState | null>(null);
   const desktopPlatform = useSyncExternalStore(
     () => () => {},
     () => window.yinchaDesktop?.platform ?? "",
@@ -190,7 +194,6 @@ export function LiveRetune() {
   const engineRef = useRef<Engine | null>(null);
   const sessionRef = useRef(0);
   const armRef = useRef(false);
-  const outputRef = useRef(output);
   const headphonesRef = useRef(false);
   const sourceRef = useRef<SourceKind>("mic");
   const phaseRef = useRef<LivePhase>("idle");
@@ -210,6 +213,8 @@ export function LiveRetune() {
     setReport(null);
     setGlobalMode(false);
     if (message) {
+      // On the desktop the players are still pinned to the cable; give them back.
+      void window.yinchaDesktop?.release?.();
       setPhase("error");
       setStatus(message);
       return;
@@ -220,7 +225,6 @@ export function LiveRetune() {
 
   useEffect(() => {
     headphonesRef.current = headphones;
-    outputRef.current = output;
     sourceRef.current = source;
     phaseRef.current = phase;
     const engine = engineRef.current;
@@ -235,6 +239,35 @@ export function LiveRetune() {
       if (engine) release(engine);
     };
   }, []);
+
+  useEffect(() => {
+    const desktop = window.yinchaDesktop;
+    if (!desktop?.audioState) return;
+    let alive = true;
+    const unsubscribe = desktop.onAudioState?.((state) => {
+      if (alive) setAudioState(state);
+    });
+    void desktop.audioState().then((state) => {
+      if (!alive) return;
+      setAudioState(state);
+      // A fresh page has no engine, so an engaged session is left over from a reload.
+      if (state.phase === "engaged" && !engineRef.current) void desktop.release?.();
+    });
+    return () => {
+      alive = false;
+      unsubscribe?.();
+    };
+  }, []);
+
+  // Headphones plugged in or pulled out mid-session: follow them.
+  const listenId = audioState?.phase === "engaged" ? audioState.listen?.id : undefined;
+  useEffect(() => {
+    const engine = engineRef.current;
+    const listen = audioState?.listen;
+    if (!listenId || !engine || !listen) return;
+    void routeOutput(engine.ctx, listen).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listenId]);
 
   const finish = async (engine: Engine) => {
     const pass = engine.pass;
@@ -271,7 +304,7 @@ export function LiveRetune() {
   const begin = async (
     kind: SourceKind,
     global = false,
-    options?: { requireCable?: boolean; audible?: boolean; routeOutput?: "speakers" | "headphones" },
+    options?: { requireCable?: boolean; audible?: boolean; routeOutput?: ListenDevice },
   ) => {
     if (engineRef.current) return false;
     if (kind === "mic" && !options?.audible && !headphonesRef.current) return false;
@@ -405,10 +438,10 @@ export function LiveRetune() {
   const startDesktop = () =>
     runOnce(async () => {
       setPhase("listening");
-      setStatus(outputRef.current === "speakers" ? "正在接到外放…" : "正在接到耳机…");
+      setStatus("正在接到虚拟声卡…");
       try {
-        const routed = await window.yinchaDesktop?.setupCable?.(outputRef.current);
-        if (!routed?.ok) {
+        const routed = await window.yinchaDesktop?.engage?.();
+        if (!routed?.ok || !routed.listen) {
           setPhase("error");
           setStatus(routed?.error || "没有接上虚拟声卡。");
           return;
@@ -416,13 +449,13 @@ export function LiveRetune() {
         const started = await begin("mic", false, {
           requireCable: true,
           audible: true,
-          routeOutput: outputRef.current,
+          routeOutput: routed.listen,
         });
-        if (!started) await window.yinchaDesktop?.restoreAudio?.();
+        if (!started) await window.yinchaDesktop?.release?.();
       } catch (error) {
         setPhase("error");
         setStatus(error instanceof Error ? error.message : "没有开始。");
-        await window.yinchaDesktop?.restoreAudio?.();
+        await window.yinchaDesktop?.release?.();
       }
     });
 
@@ -433,19 +466,26 @@ export function LiveRetune() {
     try {
       stop();
       setStatus("正在把播放器放回原来的设备…");
-      const restored = await window.yinchaDesktop?.restoreAudio?.();
+      const restored = await window.yinchaDesktop?.release?.();
       if (restored && restored.ok === false) {
         setPhase("error");
         setStatus(restored.error || "播放器还没放回去，请再点一次停止。");
         return;
       }
       setPhase("idle");
-      setStatus(restored?.restored ? "已停止，播放器回到原来的设备。" : "已停止。");
+      setStatus("已停止，播放器回到原来的设备。");
     } finally {
       armRef.current = false;
       setBusy(false);
     }
   };
+
+  const repairDesktop = () =>
+    runOnce(async () => {
+      const restored = await window.yinchaDesktop?.release?.();
+      setPhase(restored?.ok ? "idle" : "error");
+      setStatus(restored?.ok ? "声卡设置已经复原。" : restored?.error || "还是没能还原。");
+    });
 
   const rejudge = (reason?: string) => {
     const engine = engineRef.current;
@@ -461,7 +501,9 @@ export function LiveRetune() {
     setStatus(reason || "再听 8 秒，按新测得基准音调整");
     return true;
   };
-  rejudgeRef.current = rejudge;
+  useEffect(() => {
+    rejudgeRef.current = rejudge;
+  });
 
   useEffect(() => {
     if (!window.yinchaDesktop || phase !== "shifting") return;
@@ -486,6 +528,9 @@ export function LiveRetune() {
   const shiftCents = report ? 1200 * Math.log2(liveRatio(report)) : 0;
 
   const desktop = desktopPlatform === "win32";
+  // The start button waits for the startup check; error is allowed because engage restores first.
+  const audioReady = !desktop || audioState?.phase === "idle" || audioState?.phase === "error";
+  const audioBroken = desktop && !running && audioState?.phase === "error";
 
   return (
     <section className="sheet mt-8 rounded-[28px] px-5 py-6 md:px-8 md:py-8">
@@ -493,39 +538,20 @@ export function LiveRetune() {
       <h2 className="mt-2 font-figure text-3xl tracking-tight">降到 432 Hz</h2>
       <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
         {desktop
-          ? "点开始。QQ 音乐、Edge 和 Chrome 改由音叉播出，并降到 432 Hz。选外放就从喇叭出声，选耳机就从耳机出声。"
+          ? "点开始。QQ 音乐、Edge 和 Chrome 改由音叉播出，并降到 432 Hz。插着耳机就从耳机出声，没插就走外放，中途插拔会自动跟着换。"
           : "先听大约 8 秒，再按测得的基准音降到 432 Hz。用麦克风时请戴耳机，避免啸叫。"}
       </p>
 
       {desktop ? (
-        <div className="mt-5 grid grid-cols-2 gap-1 rounded-full bg-muted p-1 sm:max-w-md">
-          <Button
-            type="button"
-            variant="ghost"
-            aria-pressed={output === "speakers"}
-            disabled={running || busy}
-            className={cn(
-              "h-10 rounded-full",
-              output === "speakers" && "bg-primary text-primary-foreground hover:bg-primary/90",
-            )}
-            onClick={() => setOutput("speakers")}
-          >
-            外放
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            aria-pressed={output === "headphones"}
-            disabled={running || busy}
-            className={cn(
-              "h-10 rounded-full",
-              output === "headphones" && "bg-primary text-primary-foreground hover:bg-primary/90",
-            )}
-            onClick={() => setOutput("headphones")}
-          >
-            耳机
-          </Button>
-        </div>
+        <p
+          className={cn(
+            "mt-5 max-w-2xl rounded-2xl bg-muted px-4 py-3 text-sm leading-6",
+            audioState?.phase === "error" && "text-destructive",
+          )}
+          aria-live="polite"
+        >
+          {describeAudio(audioState)}
+        </p>
       ) : (
         <>
           <div className="mt-5 grid grid-cols-2 gap-1 rounded-full bg-muted p-1 sm:max-w-md">
@@ -573,14 +599,25 @@ export function LiveRetune() {
           <Button
             type="button"
             className="h-11 rounded-full px-5"
-            disabled={busy || (!desktop && source === "mic" && !headphones)}
+            disabled={busy || !audioReady || (!desktop && source === "mic" && !headphones)}
             onClick={() =>
               void (desktop ? startDesktop() : runOnce(async () => {
                 await begin(sourceRef.current);
               }))
             }
           >
-            {busy ? "请稍等" : phase === "error" ? "再试一次" : "开始"}
+            {busy || !audioReady ? "请稍等" : phase === "error" ? "再试一次" : "开始"}
+          </Button>
+        )}
+        {audioBroken && (
+          <Button
+            type="button"
+            variant="outline"
+            className="h-11 rounded-full px-5"
+            disabled={busy}
+            onClick={() => void repairDesktop()}
+          >
+            还原声卡
           </Button>
         )}
         {running && (
@@ -638,7 +675,7 @@ export function LiveRetune() {
 
       <p className="mt-6 max-w-2xl text-sm leading-6 text-muted-foreground">
         {desktop
-          ? "开始后先听 8 秒。切歌时，以及大约每 3 分钟，会再听一次并微调。点停止或退出音叉后，播放器不再被指定设备：插着耳机就走耳机，拔掉就回到外放。只关掉 QQ 音乐或 Edge 不会结束这一轮。"
+          ? "开始后先听 8 秒。切歌时，以及大约每 3 分钟，会再听一次并微调。点停止或退出音叉后，播放器回到开始前的设置。就算音叉意外关掉或电脑断电，下次打开音叉或开机登录时也会自动复原。只关掉 QQ 音乐或 Edge 不会结束这一轮。"
           : "分享声音时，请勾选标签页音频或系统音频。macOS 经常拿不到系统声音，需要把播放改到 BlackHole 之类的虚拟声卡，再用麦克风听。"}
       </p>
     </section>

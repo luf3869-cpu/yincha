@@ -76,49 +76,104 @@ function startServer() {
   });
 }
 
+const restoreOnly = process.argv.includes("--restore-audio");
+
 let windowRef = null;
 let audioRouter = null;
 let songWatcher = { start() {}, stop() {} };
 let deviceTimer = null;
+let deviceTicking = false;
+let quitting = false;
+
+// checking → idle ⇄ engaging → engaged → releasing → idle.
+// A failed step lands in error, which only a successful restore leaves.
+// Idle never touches the sound settings; only engaged polls devices.
+let audio = { phase: "checking", message: "", recovered: false, listen: null };
+
+function send(channel, payload) {
+  if (windowRef && !windowRef.isDestroyed()) windowRef.webContents.send(channel, payload);
+}
+
+function setAudio(next) {
+  audio = { message: "", recovered: false, listen: null, ...next };
+  send("yincha:audio-state", audio);
+}
+
+async function settle(task) {
+  try {
+    return await task;
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 function initAudioRouter() {
   audioRouter = createAudioRouter({
     svclPath: resolveSvclPath(),
     stateFile: path.join(app.getPath("userData"), "audio-state.json"),
   });
-  songWatcher = audioRouter.createSongWatcher((song) => {
-    if (!windowRef || windowRef.isDestroyed()) return;
-    windowRef.webContents.send("yincha:song-change", song);
-  });
+  songWatcher = audioRouter.createSongWatcher((song) => send("yincha:song-change", song));
 }
 
-function restoreAudioSafely() {
-  return runAudio(() => {
-    songWatcher.stop();
-    try {
-      return audioRouter.restoreAudio();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
+// A packaged build arms a one-shot logon restore while engaged, in case the PC dies mid-session.
+function bootCommand() {
+  return app.isPackaged ? `"${process.execPath}" --restore-audio` : "";
+}
+
+async function checkAudio() {
+  if (process.platform !== "win32") {
+    setAudio({ phase: "idle" });
+    return;
+  }
+  setAudio({ phase: "checking" });
+  const result = await settle(audioRouter.restore());
+  if (result.ok) setAudio({ phase: "idle", recovered: result.restored });
+  else setAudio({ phase: "error", message: result.error });
+}
+
+async function engageAudio() {
+  if (process.platform !== "win32") return { ok: false, error: "仅 Windows 支持虚拟声卡路由" };
+  if (audio.phase !== "idle" && audio.phase !== "error") return { ok: false, error: "上一步还在处理，请稍等。" };
+  setAudio({ phase: "engaging" });
+  const result = await settle(audioRouter.engage(bootCommand()));
+  if (result.ok) {
+    setAudio({ phase: "engaged", listen: result.listen });
+    startDeviceWatch();
+  } else {
+    // engage rolls itself back; a snapshot left behind means the rollback failed too.
+    setAudio({ phase: audioRouter.loadSnapshot() ? "error" : "idle", message: result.error });
+  }
+  return result;
+}
+
+async function releaseAudio() {
+  if (audio.phase === "checking" || audio.phase === "engaging" || audio.phase === "releasing") {
+    return { ok: false, error: "上一步还在处理，请稍等。" };
+  }
+  stopDeviceWatch();
+  songWatcher.stop();
+  setAudio({ phase: "releasing" });
+  const result = await settle(audioRouter.restore());
+  if (result.ok) setAudio({ phase: "idle" });
+  else setAudio({ phase: "error", message: result.error });
+  return result;
 }
 
 function tickDevices() {
-  if (!audioRouter || audioBusy) return;
-  runAudio(() => {
-    try {
-      const snapshot = audioRouter.loadSnapshot();
-      if (snapshot?.phase === "engaged") return audioRouter.reconcileEngaged();
-      return audioRouter.restoreAudio();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
+  if (audio.phase !== "engaged" || deviceTicking) return;
+  deviceTicking = true;
+  void settle(audioRouter.reconcile())
+    .then((result) => {
+      if (audio.phase !== "engaged" || !result.ok || !result.listen) return;
+      if (result.listen.id !== audio.listen?.id) setAudio({ ...audio, listen: result.listen });
+    })
+    .finally(() => {
+      deviceTicking = false;
+    });
 }
 
 function startDeviceWatch() {
-  if (process.platform !== "win32" || deviceTimer) return;
-  tickDevices();
+  if (deviceTimer) return;
   deviceTimer = setInterval(tickDevices, 4000);
 }
 
@@ -128,24 +183,10 @@ function stopDeviceWatch() {
   deviceTimer = null;
 }
 
-let audioBusy = false;
-
-function runAudio(task) {
-  if (audioBusy) return { ok: false, error: "上一步还在处理，请稍等。" };
-  audioBusy = true;
-  try {
-    return task();
-  } finally {
-    audioBusy = false;
-  }
-}
-
 function registerIpc() {
-  ipcMain.handle("yincha:setup-cable", (_event, prefer) => {
-    if (process.platform !== "win32") return { ok: false, error: "仅 Windows 支持虚拟声卡路由" };
-    return runAudio(() => audioRouter.applyCableRouting(prefer === "headphones" ? "headphones" : "speakers"));
-  });
-  ipcMain.handle("yincha:restore-audio", () => restoreAudioSafely());
+  ipcMain.handle("yincha:audio-state", () => audio);
+  ipcMain.handle("yincha:engage", () => engageAudio());
+  ipcMain.handle("yincha:release", () => releaseAudio());
   ipcMain.handle("yincha:watch-songs", (_event, enabled) => {
     if (enabled) songWatcher.start(2000);
     else songWatcher.stop();
@@ -205,6 +246,14 @@ if (!gotLock) {
   });
 
   app.whenReady().then(async () => {
+    if (restoreOnly) {
+      // Launched by the logon RunOnce entry: put the sound settings back and leave, no window.
+      initAudioRouter();
+      await settle(audioRouter.restore());
+      app.exit(0);
+      return;
+    }
+
     if (!fs.existsSync(path.join(root, "index.html"))) {
       dialog.showErrorBox("音叉", "程序文件不完整。请重新解压整个文件夹，不要只拷贝 exe。");
       app.quit();
@@ -213,6 +262,7 @@ if (!gotLock) {
 
     initAudioRouter();
     registerIpc();
+    void checkAudio();
 
     session.defaultSession.setPermissionRequestHandler((_contents, permission, callback) => {
       callback(["media", "display-capture", "audioCapture", "videoCapture", "fullscreen"].includes(permission));
@@ -241,20 +291,24 @@ if (!gotLock) {
 
     const { port } = await startServer();
     windowRef = createWindow(port);
-    startDeviceWatch();
   }).catch((error) => {
     dialog.showErrorBox("音叉", error instanceof Error ? error.message : "没有打开");
     app.quit();
   });
 
-  app.on("before-quit", () => {
+  // Quitting waits for the restore. If it fails, the snapshot and the logon entry stay,
+  // so the next start (or next logon) finishes the job.
+  app.on("before-quit", (event) => {
+    if (quitting || restoreOnly || !audioRouter) return;
+    if (!audioRouter.loadSnapshot() && audio.phase !== "engaging") return;
+    event.preventDefault();
+    quitting = true;
     stopDeviceWatch();
-    restoreAudioSafely();
+    songWatcher.stop();
+    void settle(audioRouter.restore()).finally(() => app.exit(0));
   });
 
   app.on("window-all-closed", () => {
-    stopDeviceWatch();
-    restoreAudioSafely();
     app.quit();
   });
 }
