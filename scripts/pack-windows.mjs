@@ -59,6 +59,12 @@ const appPaths = await packager({
 const appDir = appPaths[0];
 if (!appDir) throw new Error("没有生成 Windows 程序");
 fs.copyFileSync(path.join(root, "desktop", "开始使用.txt"), path.join(appDir, "开始使用.txt"));
+const svcl = path.join(root, "tools", "svcl", "svcl.exe");
+if (fs.existsSync(svcl)) {
+  const target = path.join(appDir, "tools", "svcl");
+  fs.mkdirSync(target, { recursive: true });
+  fs.copyFileSync(svcl, path.join(target, "svcl.exe"));
+}
 
 const zipPath = path.join(root, "release", "音叉-Windows.zip");
 fs.rmSync(zipPath, { force: true });

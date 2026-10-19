@@ -4,11 +4,13 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { analyzeTuning, type TuningReport } from "@/lib/analyze-tuning";
+import { pickCableOutput } from "@/lib/cable-device";
 import { workletSource } from "@/lib/live-pitch";
-import { CENTS_432, formatCents, formatHz, retuneRate } from "@/lib/tuning-math";
+import { formatCents, formatHz, retuneRate } from "@/lib/tuning-math";
 import { cn } from "@/lib/utils";
 
 const LISTEN_SECONDS = 8;
+const RELISTEN_MS = 3 * 60 * 1000;
 const GLOBAL_RATIO = 432 / 440;
 
 type SourceKind = "mic" | "display";
@@ -31,6 +33,7 @@ type Engine = {
   busy: boolean;
   lastUi: number;
   global: boolean;
+  audible: boolean;
 };
 
 function release(engine: Engine) {
@@ -89,32 +92,77 @@ function friendlyError(error: unknown): string {
   return "实时降频没有启动。";
 }
 
-async function captureMic(): Promise<MediaStream> {
+async function captureMic(requireCable = false): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error("这个浏览器不能使用麦克风。请改用 Chrome 或 Edge。");
   }
-  return navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    video: false,
-  });
+  const audio: MediaTrackConstraints = {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  };
+  const probe = await navigator.mediaDevices.getUserMedia({ audio, video: false });
+  try {
+    const cable = pickCableOutput(await navigator.mediaDevices.enumerateDevices());
+    if (!cable?.deviceId) {
+      if (requireCable) {
+        probe.getTracks().forEach((track) => track.stop());
+        throw new Error("没有找到 CABLE Output。请先安装 VB-CABLE，重启电脑后再试。");
+      }
+      return probe;
+    }
+    const routed = await navigator.mediaDevices.getUserMedia({
+      audio: { ...audio, deviceId: { exact: cable.deviceId } },
+      video: false,
+    });
+    probe.getTracks().forEach((track) => track.stop());
+    return routed;
+  } catch (error) {
+    if (requireCable) {
+      probe.getTracks().forEach((track) => track.stop());
+      throw error;
+    }
+    return probe;
+  }
+}
+
+async function routeOutput(ctx: AudioContext, prefer: "speakers" | "headphones"): Promise<boolean> {
+  const sink = ctx as AudioContext & { setSinkId?: (sinkId: string) => Promise<void> };
+  if (typeof sink.setSinkId !== "function") return false;
+  const outputs = (await navigator.mediaDevices.enumerateDevices()).filter(
+    (device) => device.kind === "audiooutput" && device.deviceId,
+  );
+  const avoid = /cable|vb-?audio|todesk|voicemeeter|virtual/i;
+  const want = prefer === "headphones" ? /耳机|headphone|headset/i : /扬声器|speaker/i;
+  const match =
+    outputs.find((device) => want.test(device.label) && !avoid.test(device.label)) ||
+    outputs.find((device) => device.deviceId !== "default" && device.deviceId !== "communications" && !avoid.test(device.label));
+  if (!match) return false;
+  await sink.setSinkId(match.deviceId);
+  return true;
 }
 
 async function captureDisplay(): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getDisplayMedia) {
     throw new Error("这个浏览器不能分享电脑里的声音。请改用 Chrome 或 Edge。");
   }
+  const desktop = Boolean(window.yinchaDesktop);
   const audio = {
     echoCancellation: false,
     noiseSuppression: false,
     autoGainControl: false,
-    suppressLocalAudioPlayback: true,
-    ...(window.yinchaDesktop ? { restrictOwnAudio: true } : {}),
+    // On the desktop app this flag mutes the playback device, so the shifted audio goes silent.
+    suppressLocalAudioPlayback: !desktop,
+    ...(desktop ? { restrictOwnAudio: true } : {}),
   } as MediaTrackConstraints;
   const stream = await navigator.mediaDevices.getDisplayMedia({
     video: true,
     audio,
   });
-  stream.getVideoTracks().forEach((track) => track.stop());
+  stream.getVideoTracks().forEach((track) => {
+    if (desktop) track.enabled = false;
+    else track.stop();
+  });
   if (stream.getAudioTracks().length === 0) {
     stream.getTracks().forEach((track) => track.stop());
     throw new Error("没有拿到声音。分享时请勾选标签页音频或系统音频。");
@@ -124,7 +172,9 @@ async function captureDisplay(): Promise<MediaStream> {
 
 export function LiveRetune() {
   const [source, setSource] = useState<SourceKind>("mic");
+  const [output, setOutput] = useState<"speakers" | "headphones">("speakers");
   const [headphones, setHeadphones] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState<LivePhase>("idle");
   const [status, setStatus] = useState("");
   const [level, setLevel] = useState(0);
@@ -139,12 +189,15 @@ export function LiveRetune() {
 
   const engineRef = useRef<Engine | null>(null);
   const sessionRef = useRef(0);
+  const armRef = useRef(false);
+  const outputRef = useRef(output);
   const headphonesRef = useRef(false);
   const sourceRef = useRef<SourceKind>("mic");
+  const phaseRef = useRef<LivePhase>("idle");
+  const rejudgeRef = useRef<(reason?: string) => boolean>(() => false);
 
   const applyGain = (engine: Engine) => {
-    const audible = engine.source === "display" || headphonesRef.current;
-    engine.gain.gain.value = audible ? 1 : 0;
+    engine.gain.gain.value = engine.audible || engine.source === "display" || headphonesRef.current ? 1 : 0;
   };
 
   const stop = (message?: string) => {
@@ -167,7 +220,9 @@ export function LiveRetune() {
 
   useEffect(() => {
     headphonesRef.current = headphones;
+    outputRef.current = output;
     sourceRef.current = source;
+    phaseRef.current = phase;
     const engine = engineRef.current;
     if (engine) applyGain(engine);
   });
@@ -213,9 +268,13 @@ export function LiveRetune() {
     }
   };
 
-  const begin = async (kind: SourceKind, global = false) => {
-    if (engineRef.current) return;
-    if (kind === "mic" && !headphonesRef.current) return;
+  const begin = async (
+    kind: SourceKind,
+    global = false,
+    options?: { requireCable?: boolean; audible?: boolean; routeOutput?: "speakers" | "headphones" },
+  ) => {
+    if (engineRef.current) return false;
+    if (kind === "mic" && !options?.audible && !headphonesRef.current) return false;
     const id = sessionRef.current + 1;
     sessionRef.current = id;
     setGlobalMode(global);
@@ -229,14 +288,18 @@ export function LiveRetune() {
     let ctx: AudioContext | null = null;
     let url = "";
     try {
-      stream = kind === "mic" ? await captureMic() : await captureDisplay();
+      stream = kind === "mic" ? await captureMic(options?.requireCable) : await captureDisplay();
       if (sessionRef.current !== id) {
         stream.getTracks().forEach((track) => track.stop());
-        return;
+        return false;
       }
       const AudioCtx = window.AudioContext;
       ctx = new AudioCtx();
       await ctx.resume();
+      if (options?.routeOutput) {
+        const routed = await routeOutput(ctx, options.routeOutput);
+        if (!routed) throw new Error("声音还停在虚拟声卡上，已停下，避免回授卡死。");
+      }
       if (!ctx.audioWorklet) {
         throw new Error("这个浏览器没有实时音频处理。请改用 Chrome 或 Edge。");
       }
@@ -247,13 +310,14 @@ export function LiveRetune() {
         stream.getTracks().forEach((track) => track.stop());
         URL.revokeObjectURL(url);
         void ctx.close();
-        return;
+        return false;
       }
 
       const input = ctx.createMediaStreamSource(stream);
       const node = new AudioWorkletNode(ctx, "yincha-live-pitch");
       const gain = ctx.createGain();
-      gain.gain.value = kind === "display" || headphonesRef.current ? 1 : 0;
+      const audible = options?.audible || kind === "display" || headphonesRef.current;
+      gain.gain.value = audible ? 1 : 0;
       node.port.postMessage({ capture: !global, ratio: global ? GLOBAL_RATIO : 1 });
       input.connect(node);
       node.connect(gain);
@@ -276,6 +340,7 @@ export function LiveRetune() {
         busy: false,
         lastUi: 0,
         global,
+        audible,
       };
       engineRef.current = engine;
       node.port.onmessage = (event: MessageEvent<{ rms?: number; samples?: Float32Array }>) => {
@@ -303,9 +368,12 @@ export function LiveRetune() {
           stop("声音中断了。");
         };
       }
+      const desktop = Boolean(window.yinchaDesktop);
       setStatus(
         global
-          ? "正在把 440 Hz 降到 432 Hz。只有一路声音，不会叠出混响。"
+          ? desktop
+            ? "正在把 440 Hz 降到 432 Hz。原来的声音还会响，会和降频叠在一起。"
+            : "正在把 440 Hz 降到 432 Hz。只有一路声音，不会叠出混响。"
           : `正在听，大约 ${LISTEN_SECONDS} 秒后开始降频`,
       );
     } catch (error) {
@@ -313,16 +381,75 @@ export function LiveRetune() {
       stream?.getTracks().forEach((track) => track.stop());
       if (url) URL.revokeObjectURL(url);
       if (ctx) void ctx.close().catch(() => undefined);
-      if (sessionRef.current !== id) return;
+      if (sessionRef.current !== id) return false;
       setPhase("error");
       setStatus(friendlyError(error));
       setLevel(0);
+      return false;
+    }
+    return true;
+  };
+
+  const runOnce = async (task: () => Promise<void>) => {
+    if (armRef.current || engineRef.current) return;
+    armRef.current = true;
+    setBusy(true);
+    try {
+      await task();
+    } finally {
+      armRef.current = false;
+      setBusy(false);
     }
   };
 
-  const rejudge = () => {
+  const startDesktop = () =>
+    runOnce(async () => {
+      setPhase("listening");
+      setStatus(outputRef.current === "speakers" ? "正在接到外放…" : "正在接到耳机…");
+      try {
+        const routed = await window.yinchaDesktop?.setupCable?.(outputRef.current);
+        if (!routed?.ok) {
+          setPhase("error");
+          setStatus(routed?.error || "没有接上虚拟声卡。");
+          return;
+        }
+        const started = await begin("mic", false, {
+          requireCable: true,
+          audible: true,
+          routeOutput: outputRef.current,
+        });
+        if (!started) await window.yinchaDesktop?.restoreAudio?.();
+      } catch (error) {
+        setPhase("error");
+        setStatus(error instanceof Error ? error.message : "没有开始。");
+        await window.yinchaDesktop?.restoreAudio?.();
+      }
+    });
+
+  const stopDesktop = async () => {
+    if (armRef.current) return;
+    armRef.current = true;
+    setBusy(true);
+    try {
+      stop();
+      setStatus("正在把播放器放回原来的设备…");
+      const restored = await window.yinchaDesktop?.restoreAudio?.();
+      if (restored && restored.ok === false) {
+        setPhase("error");
+        setStatus(restored.error || "播放器还没放回去，请再点一次停止。");
+        return;
+      }
+      setPhase("idle");
+      setStatus(restored?.restored ? "已停止，播放器回到原来的设备。" : "已停止。");
+    } finally {
+      armRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const rejudge = (reason?: string) => {
     const engine = engineRef.current;
-    if (!engine || engine.busy || engine.global) return;
+    if (!engine || engine.busy || engine.capturing) return false;
     engine.pass += 1;
     engine.chunks = [];
     engine.captured = 0;
@@ -331,78 +458,114 @@ export function LiveRetune() {
     setReport(null);
     setHeard(0);
     setPhase("listening");
-    setStatus("再听 8 秒，确认基准音");
+    setStatus(reason || "再听 8 秒，按新测得基准音调整");
+    return true;
   };
+  rejudgeRef.current = rejudge;
+
+  useEffect(() => {
+    if (!window.yinchaDesktop || phase !== "shifting") return;
+    const timer = window.setInterval(() => {
+      if (phaseRef.current === "shifting") rejudgeRef.current("每 3 分钟自动再听，个性化调整频率");
+    }, RELISTEN_MS);
+    const unsubscribe = window.yinchaDesktop.onSongChange?.((song) => {
+      if (phaseRef.current !== "shifting") return;
+      const who = song.process === "QQMusic" ? "QQ音乐" : song.process === "msedge" ? "Edge" : "播放器";
+      rejudgeRef.current(`${who}切歌：${song.title}，重新听 8 秒`);
+    });
+    void window.yinchaDesktop.watchSongs?.(true);
+    return () => {
+      window.clearInterval(timer);
+      unsubscribe?.();
+      void window.yinchaDesktop?.watchSongs?.(false);
+    };
+  }, [phase]);
 
   const running = phase === "listening" || phase === "shifting";
   const remain = Math.max(0, Math.ceil(LISTEN_SECONDS - heard));
   const shiftCents = report ? 1200 * Math.log2(liveRatio(report)) : 0;
 
+  const desktop = desktopPlatform === "win32";
+
   return (
     <section className="sheet mt-8 rounded-[28px] px-5 py-6 md:px-8 md:py-8">
       <p className="text-xs tracking-[0.16em] text-muted-foreground">听歌</p>
-      <h2 className="mt-2 font-figure text-3xl tracking-tight">整台电脑降到 432 Hz</h2>
+      <h2 className="mt-2 font-figure text-3xl tracking-tight">降到 432 Hz</h2>
       <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
-        流行歌大多按 440 Hz 调音。打开后立刻降到 432 Hz，不用先听 8
-        秒。播放中只有一路声音，不会把延迟的复制叠上去，所以没有那种混响。
+        {desktop
+          ? "点开始。QQ 音乐、Edge 和 Chrome 改由音叉播出，并降到 432 Hz。选外放就从喇叭出声，选耳机就从耳机出声。"
+          : "先听大约 8 秒，再按测得的基准音降到 432 Hz。用麦克风时请戴耳机，避免啸叫。"}
       </p>
-      {!running && (
-        <Button
-          type="button"
-          className="mt-5 h-11 rounded-full px-5"
-          onClick={() => {
-            setSource("display");
-            void begin("display", true);
-          }}
-        >
-          全局降到 432 Hz
-        </Button>
-      )}
 
-      <p className="mt-8 text-xs tracking-[0.16em] text-muted-foreground">也可以先听 8 秒再判断</p>
-      <div className="mt-3 grid grid-cols-2 gap-1 rounded-full bg-muted p-1 sm:max-w-md">
-        <Button
-          type="button"
-          variant="ghost"
-          aria-pressed={source === "mic"}
-          disabled={running}
-          className={cn(
-            "h-10 rounded-full",
-            source === "mic" && "bg-primary text-primary-foreground hover:bg-primary/90",
+      {desktop ? (
+        <div className="mt-5 grid grid-cols-2 gap-1 rounded-full bg-muted p-1 sm:max-w-md">
+          <Button
+            type="button"
+            variant="ghost"
+            aria-pressed={output === "speakers"}
+            disabled={running || busy}
+            className={cn(
+              "h-10 rounded-full",
+              output === "speakers" && "bg-primary text-primary-foreground hover:bg-primary/90",
+            )}
+            onClick={() => setOutput("speakers")}
+          >
+            外放
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            aria-pressed={output === "headphones"}
+            disabled={running || busy}
+            className={cn(
+              "h-10 rounded-full",
+              output === "headphones" && "bg-primary text-primary-foreground hover:bg-primary/90",
+            )}
+            onClick={() => setOutput("headphones")}
+          >
+            耳机
+          </Button>
+        </div>
+      ) : (
+        <>
+          <div className="mt-5 grid grid-cols-2 gap-1 rounded-full bg-muted p-1 sm:max-w-md">
+            <Button
+              type="button"
+              variant="ghost"
+              aria-pressed={source === "mic"}
+              disabled={running || busy}
+              className={cn(
+                "h-10 rounded-full",
+                source === "mic" && "bg-primary text-primary-foreground hover:bg-primary/90",
+              )}
+              onClick={() => setSource("mic")}
+            >
+              麦克风
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              aria-pressed={source === "display"}
+              disabled={running || busy}
+              className={cn(
+                "h-10 rounded-full",
+                source === "display" && "bg-primary text-primary-foreground hover:bg-primary/90",
+              )}
+              onClick={() => setSource("display")}
+            >
+              分享声音
+            </Button>
+          </div>
+          {source === "mic" && (
+            <label className="mt-5 flex items-center justify-between gap-4 text-sm sm:max-w-md">
+              <span>
+                <span className="block">我戴着耳机</span>
+                <span className="mt-1 block text-xs leading-5 text-muted-foreground">避免喇叭和麦克风啸叫。</span>
+              </span>
+              <Switch checked={headphones} onCheckedChange={setHeadphones} aria-label="我戴着耳机" />
+            </label>
           )}
-          onClick={() => setSource("mic")}
-        >
-          用麦克风听
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          aria-pressed={source === "display"}
-          disabled={running}
-          className={cn(
-            "h-10 rounded-full",
-            source === "display" && "bg-primary text-primary-foreground hover:bg-primary/90",
-          )}
-          onClick={() => setSource("display")}
-        >
-          听电脑正在放的声音
-        </Button>
-      </div>
-
-      {source === "mic" && (
-        <label className="mt-5 flex items-center justify-between gap-4 text-sm sm:max-w-md">
-          <span>
-            <span className="block">我戴着耳机</span>
-            <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-              麦克风打开后，声音只送到耳机。扬声器播放会造成啸叫。
-            </span>
-          </span>
-          <Switch
-            checked={headphones}
-            onCheckedChange={setHeadphones}
-            aria-label="我戴着耳机"
-          />
-        </label>
+        </>
       )}
 
       <div className="mt-5 flex flex-wrap items-center gap-3">
@@ -410,20 +573,30 @@ export function LiveRetune() {
           <Button
             type="button"
             className="h-11 rounded-full px-5"
-            disabled={source === "mic" && !headphones}
-            onClick={() => void begin(sourceRef.current)}
+            disabled={busy || (!desktop && source === "mic" && !headphones)}
+            onClick={() =>
+              void (desktop ? startDesktop() : runOnce(async () => {
+                await begin(sourceRef.current);
+              }))
+            }
           >
-            {phase === "error" ? "再试一次" : "开始"}
+            {busy ? "请稍等" : phase === "error" ? "再试一次" : "开始"}
           </Button>
         )}
         {running && (
           <>
-            <Button type="button" variant="outline" className="h-11 rounded-full px-5" onClick={() => stop()}>
+            <Button
+              type="button"
+              variant="outline"
+              className="h-11 rounded-full px-5"
+              disabled={busy}
+              onClick={() => void (desktop ? stopDesktop() : stop())}
+            >
               停止
             </Button>
-            {phase === "shifting" && !globalMode && (
-              <Button type="button" variant="outline" className="h-11 rounded-full px-5" onClick={rejudge}>
-                重新判断
+            {phase === "shifting" && (
+              <Button type="button" variant="outline" className="h-11 rounded-full px-5" disabled={busy} onClick={() => rejudge()}>
+                再听一次
               </Button>
             )}
           </>
@@ -463,26 +636,11 @@ export function LiveRetune() {
         </p>
       )}
 
-      <div className="mt-6 max-w-2xl space-y-2 text-sm leading-6 text-muted-foreground">
-        {desktopPlatform === "win32" ? (
-          <p>
-            这个 Windows 程序可以直接听电脑正在播放的声音，不用安装虚拟声卡。请先戴上耳机，再点「听电脑正在放的声音」。原来的播放会安静下来，你听到的是这里降频后的声音。点「停止」后恢复。标准的
-            440→432 大约是 {Math.abs(CENTS_432).toFixed(1)} 音分。
-          </p>
-        ) : (
-          <>
-            <p>
-              听电脑正在放的声音时，用 Chrome 或 Edge 分享标签页并勾选音频，或分享整个屏幕并带上系统音频。macOS
-              经常拿不到系统音频，需要下面的虚拟声卡。
-            </p>
-            <p>
-              整台电脑（网易云、Spotify、浏览器以外的程序）：把系统播放设到虚拟声卡，再选「用麦克风听」并选那条虚拟输入。Windows
-              可以用 VB-CABLE，macOS 可以用 BlackHole。请戴耳机。标准的 440→432 大约是 {Math.abs(CENTS_432).toFixed(1)}{" "}
-              音分。
-            </p>
-          </>
-        )}
-      </div>
+      <p className="mt-6 max-w-2xl text-sm leading-6 text-muted-foreground">
+        {desktop
+          ? "开始后先听 8 秒。切歌时，以及大约每 3 分钟，会再听一次并微调。点停止或退出音叉后，播放器不再被指定设备：插着耳机就走耳机，拔掉就回到外放。只关掉 QQ 音乐或 Edge 不会结束这一轮。"
+          : "分享声音时，请勾选标签页音频或系统音频。macOS 经常拿不到系统声音，需要把播放改到 BlackHole 之类的虚拟声卡，再用麦克风听。"}
+      </p>
     </section>
   );
 }
