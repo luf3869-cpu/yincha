@@ -134,6 +134,7 @@ describe("audio state machine", () => {
     csv?: string;
     failOn?: (args: string[]) => boolean;
     ignoreUnpin?: boolean;
+    sessions?: string[];
   } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yincha-"));
     const stateFile = path.join(dir, "audio-state.json");
@@ -142,6 +143,11 @@ describe("audio state machine", () => {
     if (!options.fresh) fs.writeFileSync(path.join(dir, "audio-pins-v2"), "");
     if (options.snapshot) fs.writeFileSync(stateFile, JSON.stringify(options.snapshot));
     const pins: Record<string, string> = { ...options.pins };
+    // Like Windows: svcl can only re-route an app that has an audio session right now.
+    const sessions = options.sessions ? new Set(options.sessions) : null;
+    const canRoute = (exe: string) => !sessions || sessions.has(exe);
+    const appRows = () =>
+      [...(sessions ?? [])].map((exe) => `\n${exe},Application,Render,Senary Audio,Active,No,100%,app-${exe},,,C:\\Apps\\${exe}`);
     const commands: string[][] = [];
     const runOnce: Record<string, string> = {};
 
@@ -150,12 +156,12 @@ describe("audio state machine", () => {
       stateFile,
       runFile: async (_file: string, args: string[]) => {
         if (args[0] === "/scomma") {
-          fs.writeFileSync(args[1], options.csv ?? devices);
+          fs.writeFileSync(args[1], options.csv ?? `${devices.replace(header, `${header},Process Path`)}${appRows().join("")}`);
           return "";
         }
         commands.push(args);
         if (options.failOn?.(args)) throw new Error("svcl failed");
-        if (args[0] === "/SetAppDefault") {
+        if (args[0] === "/SetAppDefault" && canRoute(args[3])) {
           if (args[1] === "DefaultRenderDevice") {
             if (!options.ignoreUnpin) delete pins[args[3]];
           } else pins[args[3]] = args[1];
@@ -179,7 +185,7 @@ describe("audio state machine", () => {
       },
     });
     const snapshot = () => (fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")) : null);
-    return { router, pins, commands, runOnce, snapshot, dir };
+    return { router, pins, commands, runOnce, snapshot, dir, sessions };
   }
 
   it("leaves a clean system alone at startup, including the user's own pins", async () => {
@@ -274,14 +280,59 @@ describe("audio state machine", () => {
     expect(broken.snapshot()).not.toBeNull();
   });
 
-  it("does not trust svcl's exit code: a pin that stays on the cable is a failure", async () => {
+  it("does not trust svcl's exit code: a running player that stays on the cable is a failure", async () => {
     const m = machine({ pins: {} });
     await m.router.engage("boot");
-    const liar = machine({ snapshot: m.snapshot(), pins: { ...m.pins }, ignoreUnpin: true });
+    const liar = machine({ snapshot: m.snapshot(), pins: { ...m.pins }, ignoreUnpin: true, sessions: ["QQMusic.exe"] });
     const result = await liar.router.restore();
     expect(result.ok).toBe(false);
     expect(result.error).toContain("QQMusic.exe");
     expect(liar.snapshot()).not.toBeNull();
+  });
+
+  it("a closed player stays pending instead of failing, and is freed when it next makes a sound", async () => {
+    const m = machine({ pins: { "chrome.exe": speakers }, sessions: ["QQMusic.exe", "msedge.exe", "chrome.exe"] });
+    await m.router.engage("boot");
+    m.sessions!.delete("msedge.exe");
+
+    const result = await m.router.restore();
+    expect(result).toMatchObject({ ok: true, restored: true, pending: ["msedge.exe"] });
+    expect(m.pins).toEqual({ "chrome.exe": speakers, "msedge.exe": cableIn });
+    expect(m.snapshot()).toMatchObject({ phase: "pending", pending: ["msedge.exe"], original: { cable: [] } });
+    expect(m.runOnce.YinchaRestoreAudio).toBe("boot");
+
+    // Still closed: nothing changes, and the cable levels are not touched again.
+    m.commands.length = 0;
+    expect(await m.router.finishPending()).toMatchObject({ ok: true, pending: ["msedge.exe"] });
+    expect(m.commands.some((args) => args[0] === "/SetVolume" || args[0] === "/Mute")).toBe(false);
+
+    m.sessions!.add("msedge.exe");
+    expect(await m.router.finishPending()).toMatchObject({ ok: true, restored: true });
+    expect(m.pins).toEqual({ "chrome.exe": speakers });
+    expect(m.snapshot()).toBeNull();
+    expect(m.runOnce).toEqual({});
+  });
+
+  it("starting again over a pending player works and keeps where it should go back to", async () => {
+    const m = machine({ pins: { "chrome.exe": speakers }, sessions: ["QQMusic.exe", "msedge.exe", "chrome.exe"] });
+    await m.router.engage("boot");
+    m.sessions!.delete("chrome.exe");
+    expect(await m.router.restore()).toMatchObject({ ok: true, pending: ["chrome.exe"] });
+
+    expect(await m.router.engage("boot")).toMatchObject({ ok: true });
+    expect(m.snapshot().original.pins).toContainEqual({ exe: "chrome.exe", endpointId: speakers });
+    m.sessions!.add("chrome.exe");
+    expect(await m.router.restore()).toMatchObject({ ok: true });
+    expect(m.pins).toEqual({ "chrome.exe": speakers });
+  });
+
+  it("finishPending leaves an engaged session alone", async () => {
+    const m = machine();
+    await m.router.engage("boot");
+    const before = { ...m.pins };
+    expect(await m.router.finishPending()).toMatchObject({ ok: true, restored: false });
+    expect(m.pins).toEqual(before);
+    expect(m.snapshot().phase).toBe("engaged");
   });
 
   it("refuses to declare a snapshot restored when the device list cannot be read", async () => {

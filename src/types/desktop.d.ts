@@ -17,6 +17,8 @@ export type AudioState = {
   message: string;
   recovered: boolean;
   listen: ListenDevice | null;
+  /** Players still on the cable because they were closed; freed the next time they make a sound. */
+  pending: string[];
 };
 
 export type EngageResult = {

@@ -136,12 +136,21 @@ async function routeOutput(ctx: AudioContext, listen: ListenDevice): Promise<boo
   return true;
 }
 
+const PLAYER_NAMES: Record<string, string> = { "qqmusic.exe": "QQ 音乐", "msedge.exe": "Edge", "chrome.exe": "Chrome" };
+
+function playerName(exe: string): string {
+  return PLAYER_NAMES[exe.toLowerCase()] ?? exe;
+}
+
 function describeAudio(state: AudioState | null): string {
   if (!state || state.phase === "checking") return "正在检查声卡设置…";
   if (state.phase === "engaging") return "正在接到虚拟声卡…";
   if (state.phase === "releasing") return "正在把播放器放回原来的设备…";
   if (state.phase === "error") return `声卡设置没有还原：${state.message}`;
   if (state.phase === "engaged") return state.listen ? `正在从「${state.listen.name}」播出。` : "";
+  if (state.pending?.length) {
+    return `${state.pending.map(playerName).join("、")} 没开着，还接在虚拟声卡上。下次它出声时音叉会自动放回，不用管。`;
+  }
   if (state.recovered) return "上次退出时声卡设置没有还原，已经复原。";
   return "声卡设置正常。插着耳机就从耳机播出，没插就走外放。";
 }

@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const { app, BrowserWindow, desktopCapturer, dialog, ipcMain, session, shell } = require("electron");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
@@ -83,19 +84,23 @@ let audioRouter = null;
 let songWatcher = { start() {}, stop() {} };
 let deviceTimer = null;
 let deviceTicking = false;
+let pendingTimer = null;
+let pendingTicking = false;
 let quitting = false;
 
 // checking → idle ⇄ engaging → engaged → releasing → idle.
 // A failed step lands in error, which only a successful restore leaves.
-// Idle never touches the sound settings; only engaged polls devices.
-let audio = { phase: "checking", message: "", recovered: false, listen: null };
+// Idle never touches the sound settings; only engaged polls devices, and idle with
+// `pending` players (closed when we restored, so Windows would not let us move them)
+// polls until each one makes a sound and can be freed.
+let audio = { phase: "checking", message: "", recovered: false, listen: null, pending: [] };
 
 function send(channel, payload) {
   if (windowRef && !windowRef.isDestroyed()) windowRef.webContents.send(channel, payload);
 }
 
 function setAudio(next) {
-  audio = { message: "", recovered: false, listen: null, ...next };
+  audio = { message: "", recovered: false, listen: null, pending: [], ...next };
   send("yincha:audio-state", audio);
 }
 
@@ -127,21 +132,57 @@ async function checkAudio() {
   }
   setAudio({ phase: "checking" });
   const result = await settle(audioRouter.restore());
-  if (result.ok) setAudio({ phase: "idle", recovered: result.restored });
+  if (result.ok) settleIdle(result, result.restored);
   else setAudio({ phase: "error", message: result.error });
+}
+
+function settleIdle(result, recovered) {
+  const pending = result.pending || [];
+  setAudio({ phase: "idle", recovered, pending });
+  if (pending.length) startPendingWatch();
+  else stopPendingWatch();
+}
+
+function tickPending() {
+  if (audio.phase !== "idle" || pendingTicking) return;
+  pendingTicking = true;
+  void settle(audioRouter.finishPending())
+    .then((result) => {
+      if (audio.phase !== "idle" || !result.ok) return;
+      const pending = result.pending || [];
+      if (pending.join() !== audio.pending.join()) setAudio({ ...audio, pending });
+      if (!pending.length) stopPendingWatch();
+    })
+    .finally(() => {
+      pendingTicking = false;
+    });
+}
+
+function startPendingWatch() {
+  if (pendingTimer) return;
+  pendingTimer = setInterval(tickPending, 4000);
+}
+
+function stopPendingWatch() {
+  if (!pendingTimer) return;
+  clearInterval(pendingTimer);
+  pendingTimer = null;
 }
 
 async function engageAudio() {
   if (process.platform !== "win32") return { ok: false, error: "仅 Windows 支持虚拟声卡路由" };
   if (audio.phase !== "idle" && audio.phase !== "error") return { ok: false, error: "上一步还在处理，请稍等。" };
+  stopPendingWatch();
   setAudio({ phase: "engaging" });
   const result = await settle(audioRouter.engage(bootCommand()));
   if (result.ok) {
     setAudio({ phase: "engaged", listen: result.listen });
     startDeviceWatch();
   } else {
-    // engage rolls itself back; a snapshot left behind means the rollback failed too.
-    setAudio({ phase: audioRouter.loadSnapshot() ? "error" : "idle", message: result.error });
+    // engage rolls itself back; a snapshot left behind (other than pending) means the rollback failed too.
+    const left = audioRouter.loadSnapshot();
+    if (left && left.phase !== "pending") setAudio({ phase: "error", message: result.error });
+    else settleIdle({ pending: left?.pending }, false);
   }
   return result;
 }
@@ -154,7 +195,7 @@ async function releaseAudio() {
   songWatcher.stop();
   setAudio({ phase: "releasing" });
   const result = await settle(audioRouter.restore());
-  if (result.ok) setAudio({ phase: "idle" });
+  if (result.ok) settleIdle(result, false);
   else setAudio({ phase: "error", message: result.error });
   return result;
 }
@@ -235,7 +276,8 @@ function createWindow(port) {
   return win;
 }
 
-const gotLock = app.requestSingleInstanceLock();
+// The logon helper stays out of the lock, or it would swallow the user opening the app.
+const gotLock = restoreOnly || app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
@@ -247,9 +289,14 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     if (restoreOnly) {
-      // Launched by the logon RunOnce entry: put the sound settings back and leave, no window.
+      // Launched by the logon RunOnce entry, or by quitting with players still pending:
+      // put the sound settings back, wait out any pending player, and leave. No window.
       initAudioRouter();
       await settle(audioRouter.restore());
+      while (audioRouter.loadSnapshot()?.phase === "pending") {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await settle(audioRouter.finishPending());
+      }
       app.exit(0);
       return;
     }
@@ -304,8 +351,16 @@ if (!gotLock) {
     event.preventDefault();
     quitting = true;
     stopDeviceWatch();
+    stopPendingWatch();
     songWatcher.stop();
-    void settle(audioRouter.restore()).finally(() => app.exit(0));
+    void settle(audioRouter.restore()).finally(() => {
+      // A player that was closed is still on the cable; a windowless helper frees it
+      // the next time it makes a sound. The logon entry stays armed too.
+      if (app.isPackaged && audioRouter.loadSnapshot()?.phase === "pending") {
+        spawn(process.execPath, ["--restore-audio"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+      }
+      app.exit(0);
+    });
   });
 
   app.on("window-all-closed", () => {

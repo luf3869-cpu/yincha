@@ -16,6 +16,9 @@ const VIRTUAL_PLAYBACK = /todesk|dubbing|voicemeeter|vb-?audio|virtual\s*(cable|
 // The snapshot file is the whole state machine on disk:
 //   absent             nothing of ours is in the system; idle never touches devices
 //   engaging/engaged   players may point at CABLE Input; `original` is how to undo it
+//   pending            restored, except players that were not running: Windows only lets us
+//                      move an app that has an audio session, so `pending` lists the ones
+//                      still on the cable until they next make a sound
 // It is written before the first change and deleted only after a restore is verified,
 // so a crash at any point leaves either nothing or a snapshot the next start replays.
 
@@ -158,6 +161,12 @@ function pickListenDevice(rows) {
   );
 }
 
+// svcl can only re-route an app that has an audio session right now; a closed player
+// silently keeps its pin. Its next sound is when it can be freed.
+function hasSession(rows, exe) {
+  return rows.some((row) => row.Type === "Application" && sameId(`${processNameFromPath(row["Process Path"])}.exe`, exe));
+}
+
 function describeDevice(row) {
   return { id: row["Item ID"] || "", name: row.Name || "", deviceName: row["Device Name"] || "" };
 }
@@ -234,13 +243,16 @@ function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runR
 
   async function listRows() {
     if (!svclExists()) return [];
-    const csvPath = path.join(path.dirname(stateFile), "devices-now.csv");
+    // Per process: the logon helper and the app may both be polling.
+    const csvPath = path.join(path.dirname(stateFile), `devices-${process.pid}.csv`);
     try {
       fs.mkdirSync(path.dirname(csvPath), { recursive: true });
       await runFile(svclPath, ["/scomma", csvPath]);
       return parseDeviceCsv(decodeText(fs.readFileSync(csvPath)));
     } catch {
       return [];
+    } finally {
+      fs.rm(csvPath, { force: true }, () => undefined);
     }
   }
 
@@ -333,12 +345,19 @@ function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runR
 
     // Verify instead of trusting exit codes: the snapshot goes only once nothing of ours is left.
     const failures = results.filter((result) => !result.ok).map((result) => result.error);
-    if (results.length) {
-      const stuck = (await readPins()).filter(ours);
-      if (stuck.length) failures.push(`${stuck.map((pin) => pin.exe).join("、")} 还接在虚拟声卡上`);
-    }
+    const stuck = results.length ? (await readPins()).filter(ours) : [];
+    const live = stuck.filter((pin) => hasSession(rows, pin.exe));
+    if (live.length) failures.push(`${live.map((pin) => pin.exe).join("、")} 还接在虚拟声卡上`);
     if (failures.length) {
       return { ok: false, restored: false, error: failures.filter(Boolean).join("；") || "声卡没有还原" };
+    }
+    if (stuck.length) {
+      // Not running, so not playing into the cable either. Keep only what is left to undo.
+      const pending = [...new Set(stuck.map((pin) => pin.exe))];
+      const wants = snapshot?.version === SNAPSHOT_VERSION ? snapshot.original?.pins || [] : [];
+      const left = pending.map((exe) => wants.find((want) => sameId(want.exe, exe)) || { exe, endpointId: "" });
+      saveSnapshot({ version: SNAPSHOT_VERSION, phase: "pending", pending, original: { pins: left, cable: [] }, savedAt: new Date().toISOString() });
+      return { ok: true, restored: Boolean(snapshot) || results.length > 0, pending };
     }
     if (snapshot) {
       forgetSnapshot();
@@ -352,9 +371,13 @@ function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runR
   }
 
   async function engageNow(bootCommand) {
+    // A player still pending from last time goes back on the cable now; what it should
+    // return to afterwards carries over.
+    let carried = [];
     if (loadSnapshot()) {
       const restored = await restoreNow();
       if (!restored.ok) return { ok: false, error: `上次的设置还没还原：${restored.error}` };
+      if (restored.pending) carried = loadSnapshot()?.original?.pins || [];
     }
     const rows = await listRows();
     const { cableIn, cableOut } = findCable(rows);
@@ -365,6 +388,8 @@ function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runR
     const pins = await readPins();
     const original = {
       pins: PLAYER_EXES.map((exe) => {
+        const kept = carried.find((item) => sameId(item.exe, exe));
+        if (kept) return { exe, endpointId: kept.endpointId || "" };
         const pin = pins.find((item) => sameId(item.exe, exe));
         return { exe, endpointId: pin && !isCableDevice(rows.find((row) => sameId(row["Item ID"], pin.endpointId))) ? pin.endpointId : "" };
       }),
@@ -391,6 +416,12 @@ function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runR
     }
     saveSnapshot({ version: SNAPSHOT_VERSION, phase: "engaged", original, savedAt: new Date().toISOString() });
     return { ok: true, listen: describeDevice(listen) };
+  }
+
+  // Only finishes a pending restore; anything else (say the app just engaged) is left alone.
+  async function finishPendingNow() {
+    if (loadSnapshot()?.phase !== "pending") return { ok: true, restored: false };
+    return restoreNow();
   }
 
   // While engaged: keep players on the cable and report where the retuned sound should go.
@@ -447,6 +478,7 @@ function createAudioRouter({ svclPath, stateFile, runFile = defaultRunFile, runR
     svclExists,
     loadSnapshot,
     restore: () => serial(restoreNow),
+    finishPending: () => serial(finishPendingNow),
     engage: (bootCommand) => serial(() => engageNow(bootCommand)),
     reconcile: () => serial(reconcileNow),
     createSongWatcher,
